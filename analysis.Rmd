@@ -1,0 +1,160 @@
+---
+title: "CDC Diabetes Health Indicators Analysis"
+author: "Group Project"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(glmnet)
+library(caret)
+library(corrplot)
+```
+
+# Introduction
+
+This project analyzes the CDC Diabetes Health Indicators dataset to predict whether an individual has diabetes based on various lifestyle factors and health indicators. The goal is to build a binary classification model that can accurately identify individuals at risk of diabetes. We will explore the data, handle multicollinearity, and compare different logistic regression models, including those with regularization (LASSO and Ridge).
+
+# Data Description
+
+The dataset is obtained from the UCI Machine Learning Repository (ID: 891). It contains health indicators for 253,680 individuals.
+
+## Raw Data and Pre-processing
+
+The raw data was fetched using the `ucimlrepo` Python package and exported to a CSV file. The dataset includes a binary target variable `Diabetes_binary` (0 = no diabetes, 1 = pre-diabetes or diabetes) and 21 feature variables.
+
+```{r load_data}
+# Load data
+data <- read.csv("diabetes_data.csv")
+
+# Convert target to factor
+data$Diabetes_binary <- as.factor(data$Diabetes_binary)
+
+# Check for missing values
+missing_values <- sum(is.na(data))
+```
+
+The dataset contains `r nrow(data)` observations and `r ncol(data)` variables. There are `r missing_values` missing values in the dataset.
+
+## Predictor Selection
+
+We initially consider all available predictors. However, we will check for multicollinearity and use LASSO regularization to select the most relevant variables.
+
+The predictors include:
+`r paste(names(data)[-1], collapse = ", ")`
+
+# Exploratory Data Analysis (EDA)
+
+Let's look at the distribution of the target variable.
+
+```{r eda_target, fig.height=4, fig.width=6}
+ggplot(data, aes(x = Diabetes_binary)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Distribution of Diabetes Status", x = "Diabetes (0 = No, 1 = Yes)", y = "Count") +
+  theme_minimal()
+```
+
+We can also examine the correlation between numeric predictors to identify potential multicollinearity.
+
+```{r correlation, fig.height=8, fig.width=8}
+# Calculate correlation matrix for numeric predictors
+numeric_vars <- data %>% select(-Diabetes_binary)
+cor_matrix <- cor(numeric_vars)
+corrplot(cor_matrix, method = "color", type = "upper", tl.col = "black", tl.cex = 0.7)
+```
+
+# Methodology
+
+We will split the data into training (80%) and testing (20%) sets.
+
+```{r split_data}
+set.seed(123)
+trainIndex <- createDataPartition(data$Diabetes_binary, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+dataTrain <- data[ trainIndex,]
+dataTest  <- data[-trainIndex,]
+```
+
+## Logistic Regression
+
+We fit a standard logistic regression model using all predictors.
+
+```{r logistic_model}
+model_glm <- glm(Diabetes_binary ~ ., data = dataTrain, family = "binomial")
+summary(model_glm)
+```
+
+## Regularization (LASSO and Ridge)
+
+We use `glmnet` to fit LASSO (alpha = 1) and Ridge (alpha = 0) models. We use cross-validation to find the optimal lambda.
+
+```{r glmnet_prep}
+x_train <- model.matrix(Diabetes_binary ~ ., dataTrain)[,-1]
+y_train <- dataTrain$Diabetes_binary
+
+x_test <- model.matrix(Diabetes_binary ~ ., dataTest)[,-1]
+y_test <- dataTest$Diabetes_binary
+```
+
+### LASSO (L1 Regularization)
+
+```{r lasso}
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1, family = "binomial")
+best_lambda_lasso <- cv_lasso$lambda.min
+model_lasso <- glmnet(x_train, y_train, alpha = 1, family = "binomial", lambda = best_lambda_lasso)
+
+# Coefficients
+coef(model_lasso)
+```
+
+The optimal lambda for LASSO is `r best_lambda_lasso`. LASSO performs variable selection by shrinking some coefficients to zero.
+
+### Ridge (L2 Regularization)
+
+```{r ridge}
+cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0, family = "binomial")
+best_lambda_ridge <- cv_ridge$lambda.min
+model_ridge <- glmnet(x_train, y_train, alpha = 0, family = "binomial", lambda = best_lambda_ridge)
+```
+
+The optimal lambda for Ridge is `r best_lambda_ridge`.
+
+# Results
+
+We compare the models based on accuracy on the test set.
+
+```{r evaluation}
+# Logistic Regression Predictions
+prob_glm <- predict(model_glm, dataTest, type = "response")
+pred_glm <- ifelse(prob_glm > 0.5, 1, 0)
+acc_glm <- mean(pred_glm == dataTest$Diabetes_binary)
+
+# LASSO Predictions
+prob_lasso <- predict(model_lasso, newx = x_test, type = "response")
+pred_lasso <- ifelse(prob_lasso > 0.5, 1, 0)
+acc_lasso <- mean(pred_lasso == y_test)
+
+# Ridge Predictions
+prob_ridge <- predict(model_ridge, newx = x_test, type = "response")
+pred_ridge <- ifelse(prob_ridge > 0.5, 1, 0)
+acc_ridge <- mean(pred_ridge == y_test)
+```
+
+- **Logistic Regression Accuracy**: `r round(acc_glm, 4)`
+- **LASSO Accuracy**: `r round(acc_lasso, 4)`
+- **Ridge Accuracy**: `r round(acc_ridge, 4)`
+
+# Conclusion
+
+In this analysis, we built logistic regression models to predict diabetes. We compared a standard model with LASSO and Ridge regularization. 
+
+(Note: Specific conclusions will depend on the actual run results).
+
+\newpage
+# Appendix: R Code
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
