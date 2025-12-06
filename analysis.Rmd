@@ -1,6 +1,6 @@
 ---
 title: "CDC Diabetes Health Indicators Analysis"
-author: "Group Project"
+author: "Josie Charles, Ray Prasad, Dawson Ren"
 date: "`r Sys.Date()`"
 output: pdf_document
 ---
@@ -11,6 +11,9 @@ library(tidyverse)
 library(glmnet)
 library(caret)
 library(corrplot)
+library(pROC)
+library(rpart)
+library(rpart.plot)
 ```
 
 # Introduction
@@ -31,19 +34,9 @@ data <- read.csv("diabetes_data.csv")
 
 # Convert target to factor
 data$Diabetes_binary <- as.factor(data$Diabetes_binary)
-
-# Check for missing values
-missing_values <- sum(is.na(data))
 ```
 
-The dataset contains `r nrow(data)` observations and `r ncol(data)` variables. There are `r missing_values` missing values in the dataset.
-
-## Predictor Selection
-
-We initially consider all available predictors. However, we will check for multicollinearity and use LASSO regularization to select the most relevant variables.
-
-The predictors include:
-`r paste(names(data)[-1], collapse = ", ")`
+The dataset contains `r nrow(data)` observations and `r ncol(data)` variables. There are no missing values in the dataset.
 
 # Exploratory Data Analysis (EDA)
 
@@ -56,6 +49,8 @@ ggplot(data, aes(x = Diabetes_binary)) +
   theme_minimal()
 ```
 
+Notice that there is significant class imbalance, only `r mean(data$Diabetes_binary)` percent of interviewed people had diabetes. We will look at up/downweighting to deal with the class imbalance.
+
 We can also examine the correlation between numeric predictors to identify potential multicollinearity.
 
 ```{r correlation, fig.height=8, fig.width=8}
@@ -65,96 +60,435 @@ cor_matrix <- cor(numeric_vars)
 corrplot(cor_matrix, method = "color", type = "upper", tl.col = "black", tl.cex = 0.7)
 ```
 
+```{r correlation_pairs, fig.height=8, fig.width=8}
+# Find and print pairs with specific correlation strengths
+cor_melted <- as.data.frame(as.table(cor_matrix))
+names(cor_melted) <- c("Var1", "Var2", "Correlation")
+
+# Filter out self-correlations and duplicate pairs
+cor_melted <- cor_melted %>%
+  filter(as.character(Var1) < as.character(Var2))
+
+print_correlation_pairs <- function(df, lower_bound, upper_bound, strength_label) {
+  pairs <- df %>%
+    filter(abs(Correlation) >= lower_bound & abs(Correlation) < upper_bound) %>%
+    arrange(desc(abs(Correlation)))
+
+  if (nrow(pairs) > 0) {
+    cat(paste0("\n--- ", strength_label, " Correlations (", lower_bound, "-", upper_bound, ") ---\n"))
+    for (i in 1:nrow(pairs)) {
+      cat(sprintf("%s - %s: %.2f\n", pairs$Var1[i], pairs$Var2[i], pairs$Correlation[i]))
+    }
+  } else {
+    cat(paste0("\n--- No ", strength_label, " Correlations found (", lower_bound, "-", upper_bound, ") ---\n"))
+  }
+}
+
+print_correlation_pairs(cor_melted, 0.2, 0.4, "Weak")
+print_correlation_pairs(cor_melted, 0.4, 0.6, "Moderate")
+print_correlation_pairs(cor_melted, 0.6, 1.0, "Strong")
+```
+
+The strongest correlations are between GenHlth/PhysHlth/DiffWalk, and Education/Income. This makes sense,
+as people with better general health likely have better physical health and less difficulty walking.
+And people with higher education are likely to have a higher income.
+
+We also calculate the variance inflation factor (VIF) to better identify multicollinearity.
+
+```{r vif, fig.height=8, fig.width=8}
+# Calculate by inverting the correlation matrix
+X <- data %>% select(-Diabetes_binary)
+# turn X into a matrix
+X <- as.matrix(X)
+# calculate the correlation matrix
+cor_matrix <- cor(X)
+# calculate the VIF
+vif <- diag(solve(cor_matrix))
+
+# Visualize VIF
+barplot(vif, main = "Variance Inflation Factor", xlab = "Variable", ylab = "VIF", horiz = TRUE)
+```
+
+It seems that the VIFs are relatively small, so we do not need to remove any variables.
+
 # Methodology
 
-We will split the data into training (80%) and testing (20%) sets.
+We will use K-fold Cross-Validation (5-fold) for model training and evaluation to ensure stability.
+We will also address class imbalance using upsampling and downsampling techniques.
+Furthermore, we will use LASSO to select the best variables, including interaction and quadratic terms.
 
 ```{r split_data}
 set.seed(123)
-trainIndex <- createDataPartition(data$Diabetes_binary, p = .8, 
-                                  list = FALSE, 
-                                  times = 1)
-dataTrain <- data[ trainIndex,]
-dataTest  <- data[-trainIndex,]
+# Ensure target is a factor with valid names for caret
+data$Diabetes_binary <- factor(data$Diabetes_binary, levels = c("0", "1"), labels = c("No", "Yes"))
+
+trainIndex <- createDataPartition(data$Diabetes_binary,
+  p = .8,
+  list = FALSE,
+  times = 1
+)
+dataTrain <- data[trainIndex, ]
+dataTest <- data[-trainIndex, ]
 ```
 
-## Logistic Regression
+## Modeling
 
-We fit a standard logistic regression model using all predictors.
+We will train three types of models:
+1. **Logistic Regression** (Baseline)
+2. **Logistic Regression with Class Balancing** (Up/Downsampling)
+3. **Logistic Regression with LASSO**
 
-```{r logistic_model}
-model_glm <- glm(Diabetes_binary ~ ., data = dataTrain, family = "binomial")
-summary(model_glm)
+```{r train_control}
+# Define train control with 5-fold CV and class probabilities
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  savePredictions = "final"
+)
 ```
 
-## Regularization (LASSO and Ridge)
+### Logistic Regression
 
-We use `glmnet` to fit LASSO (alpha = 1) and Ridge (alpha = 0) models. We use cross-validation to find the optimal lambda.
+```{r logistic_models}
+# Standard Logistic Regression (No sampling)
+set.seed(123)
+model_glm <- train(Diabetes_binary ~ .,
+  data = dataTrain,
+  method = "glm",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl
+)
 
-```{r glmnet_prep}
-x_train <- model.matrix(Diabetes_binary ~ ., dataTrain)[,-1]
-y_train <- dataTrain$Diabetes_binary
+# Logistic Regression with Downsampling
+ctrl_down <- ctrl
+ctrl_down$sampling <- "down"
+set.seed(123)
+model_glm_down <- train(Diabetes_binary ~ .,
+  data = dataTrain,
+  method = "glm",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl_down
+)
 
-x_test <- model.matrix(Diabetes_binary ~ ., dataTest)[,-1]
-y_test <- dataTest$Diabetes_binary
+# Logistic Regression with Upsampling
+ctrl_up <- ctrl
+ctrl_up$sampling <- "up"
+set.seed(123)
+model_glm_up <- train(Diabetes_binary ~ .,
+  data = dataTrain,
+  method = "glm",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl_up
+)
 ```
 
-### LASSO (L1 Regularization)
+```{r}
+# Logistic Regression using LASSO
+# We use glmnet for LASSO. We tune lambda. Alpha is set to 1 for LASSO.
+set.seed(123)
+lasso_grid <- expand.grid(alpha = 1, lambda = 10^seq(-4, -1, length = 100))
 
-```{r lasso}
-cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1, family = "binomial")
-best_lambda_lasso <- cv_lasso$lambda.min
-model_lasso <- glmnet(x_train, y_train, alpha = 1, family = "binomial", lambda = best_lambda_lasso)
+vars <- colnames(dataTrain)
+vars <- vars[vars != "Diabetes_binary"]
+interaction_terms <- paste(vars, collapse = " + ")
 
-# Coefficients
-coef(model_lasso)
+# add quadratic terms for interaction terms
+formula <- as.formula(
+  paste("Diabetes_binary ~ (", interaction_terms, ")^2 + I(BMI^2) + I(MentHlth^2) + I(GenHlth^2) + I(Age^2) + I(Income^2)")
+)
+
+model_lasso <- train(formula,
+  data = dataTrain,
+  method = "glmnet",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl_down, # Using downsampling
+  tuneGrid = lasso_grid
+)
 ```
 
-The optimal lambda for LASSO is `r best_lambda_lasso`. LASSO performs variable selection by shrinking some coefficients to zero.
-
-### Ridge (L2 Regularization)
-
-```{r ridge}
-cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0, family = "binomial")
-best_lambda_ridge <- cv_ridge$lambda.min
-model_ridge <- glmnet(x_train, y_train, alpha = 0, family = "binomial", lambda = best_lambda_ridge)
+```{r}
+# Plot the coefficient path
+plot(model_lasso$finalModel, xvar = "lambda", label = TRUE)
+title("LASSO Coefficient Path", line = 2.5)
 ```
 
-The optimal lambda for Ridge is `r best_lambda_ridge`.
+```{r}
+lasso_coefs <- coef(model_lasso$finalModel, s = model_lasso$bestTune$lambda)
+lasso_coefs_vec <- as.vector(lasso_coefs)
+names(lasso_coefs_vec) <- rownames(lasso_coefs)
+lasso_coefs <- lasso_coefs_vec[names(lasso_coefs_vec) != "(Intercept)"]
+lasso_coefs <- sort(lasso_coefs, decreasing = TRUE)
+print(lasso_coefs)
+```
 
-# Results
+Select 1SE sparser model.
+```{r}
+res <- model_lasso$results
+best_idx <- which.max(res$ROC)
+best <- res[best_idx, ]
 
-We compare the models based on accuracy on the test set.
+roc_se <- best$ROCSD / sqrt(model_lasso$control$number)
+threshold <- best$ROC - roc_se
+
+one_se_idx <- max(which(res$ROC >= threshold))
+lambda_1se <- res$lambda[one_se_idx]
+
+coef_1se <- coef(model_lasso$finalModel, s = lambda_1se)
+coef_1se_vec <- as.vector(coef_1se)
+names(coef_1se_vec) <- rownames(coef_1se)
+coef_1se <- coef_1se_vec[names(coef_1se_vec) != "(Intercept)"]
+coef_1se <- sort(coef_1se, decreasing = TRUE)
+print(coef_1se)
+```
+
+We only take coefficients with absolute values greater than 0.1. This is nonstandard,
+but we do this to identify a very sparse model.
+```{r}
+coef_1se <- coef_1se[abs(coef_1se) > 0.1]
+print(coef_1se)
+```
+
+Finally, we refit the model with the selected variables.
+```{r}
+formula_lasso_1se <- as.formula(
+  paste("Diabetes_binary ~ ", paste(names(coef_1se), collapse = " + "))
+)
+model_lasso_1se <- train(formula_lasso_1se,
+  data = dataTrain,
+  method = "glm",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl_down
+)
+``` 
+
+## Residual Analysis
+
+Let's examine the residuals of the logistic regression model to check for non-linearities.
+
+```{r residual_analysis}
+plot_residuals <- function(model, dataTrain, var_name) {
+  # Calculate residuals on the full training set
+  # We use the downsampled model to predict on the original training data
+  probs_train <- predict(model, dataTrain, type = "prob")[, "Yes"]
+  y_train_num <- ifelse(dataTrain$Diabetes_binary == "Yes", 1, 0)
+
+  # Calculate Pearson residuals
+  # Avoid division by zero if probs are 0 or 1 (add small epsilon)
+  epsilon <- 1e-6
+  probs_train <- pmax(pmin(probs_train, 1 - epsilon), epsilon)
+  residuals_pearson <- (y_train_num - probs_train) / sqrt(probs_train * (1 - probs_train))
+
+  # gut check: residuals should be close to 0 for linear relationships
+  cat("Gut Check: Residuals should be close to 0 for linear relationships\n")
+  cat("Mean Residual: ", mean(residuals_pearson), "\n")
+
+  # Plot Residuals vs BMI
+  # We use a sample of points to avoid overplotting if the dataset is huge
+  set.seed(123)
+  sample_idx <- sample(1:nrow(dataTrain), min(5000, nrow(dataTrain)))
+
+  plot(dataTrain[[var_name]][sample_idx], residuals_pearson[sample_idx],
+    main = paste("Pearson Residuals vs", var_name),
+    xlab = var_name, ylab = "Pearson Residuals",
+    pch = 20, col = rgb(0, 0, 0, 0.2)
+  )
+  lines(lowess(dataTrain[[var_name]][sample_idx], residuals_pearson[sample_idx]), col = "red", lwd = 2)
+}
+
+plot_deviance_residuals <- function(model, dataTrain, var_name) {
+  # Predict probabilities on the full training set
+  probs_train <- predict(model, dataTrain, type = "prob")[, "Yes"]
+  y_train_num <- ifelse(dataTrain$Diabetes_binary == "Yes", 1, 0)
+
+  # Avoid probabilities exactly 0 or 1
+  epsilon <- 1e-6
+  probs_train <- pmax(pmin(probs_train, 1 - epsilon), epsilon)
+
+  # Deviance residuals for Bernoulli / binomial
+  # r_i = sign(y_i - p_i) * sqrt(2 * [ y_i log(y_i/p_i) + (1-y_i) log((1-y_i)/(1-p_i)) ])
+  # Handle y_i = 0 or 1 explicitly so we never take log(0)
+  term1 <- ifelse(y_train_num == 0,
+    0,
+    y_train_num * log(y_train_num / probs_train)
+  )
+  term2 <- ifelse(y_train_num == 1,
+    0,
+    (1 - y_train_num) * log((1 - y_train_num) / (1 - probs_train))
+  )
+
+  dev_i <- 2 * (term1 + term2)
+  residuals_deviance <- sign(y_train_num - probs_train) * sqrt(dev_i)
+
+  # Gut check
+  cat("Gut Check: Deviance residuals should be roughly symmetric around 0\n")
+  cat("Mean Residual: ", mean(residuals_deviance), "\n")
+
+  # Plot Residuals vs chosen variable
+  set.seed(123)
+  sample_idx <- sample(1:nrow(dataTrain), min(5000, nrow(dataTrain)))
+
+  plot(dataTrain[[var_name]][sample_idx], residuals_deviance[sample_idx],
+    main = paste("Deviance Residuals vs", var_name),
+    xlab = var_name, ylab = "Deviance Residuals",
+    pch = 20, col = rgb(0, 0, 0, 0.2)
+  )
+  lines(lowess(dataTrain[[var_name]][sample_idx], residuals_deviance[sample_idx]),
+    col = "red", lwd = 2
+  )
+}
+```
+
+Check BMI, MentHlth, GenHlth, PhysHlth, Age, Education, Income
+
+```{r}
+plot_deviance_residuals(model_glm, dataTrain, "BMI")
+```
+
+# Results and Evaluation
+
+We evaluate the models on the holdout test set using ROC-AUC, Sensitivity (Recall), and Specificity.
 
 ```{r evaluation}
-# Logistic Regression Predictions
-prob_glm <- predict(model_glm, dataTest, type = "response")
-pred_glm <- ifelse(prob_glm > 0.5, 1, 0)
-acc_glm <- mean(pred_glm == dataTest$Diabetes_binary)
+# Function to calculate metrics
+calc_metrics <- function(model, test_data) {
+  probs <- predict(model, test_data, type = "prob")[, "Yes"]
+  preds <- predict(model, test_data, type = "raw")
 
-# LASSO Predictions
-prob_lasso <- predict(model_lasso, newx = x_test, type = "response")
-pred_lasso <- ifelse(prob_lasso > 0.5, 1, 0)
-acc_lasso <- mean(pred_lasso == y_test)
+  cm <- confusionMatrix(preds, test_data$Diabetes_binary, positive = "Yes")
+  roc_obj <- roc(test_data$Diabetes_binary, probs)
+  auc_val <- auc(roc_obj)
 
-# Ridge Predictions
-prob_ridge <- predict(model_ridge, newx = x_test, type = "response")
-pred_ridge <- ifelse(prob_ridge > 0.5, 1, 0)
-acc_ridge <- mean(pred_ridge == y_test)
+  list(
+    CM = cm,
+    AUC = auc_val,
+    F1 = cm$byClass["F1"],
+    Recall = cm$byClass["Sensitivity"],
+    Precision = cm$byClass["Precision"]
+  )
+}
+
+metrics_glm <- calc_metrics(model_glm, dataTest)
+metrics_down <- calc_metrics(model_glm_down, dataTest)
+metrics_up <- calc_metrics(model_glm_up, dataTest)
+metrics_lasso <- calc_metrics(model_lasso, dataTest)
+metrics_lasso_1se <- calc_metrics(model_lasso_1se, dataTest)
+
+# Display Comparison
+results_df <- data.frame(
+  Model = c("GLM (Standard)", "GLM (Downsample)", "GLM (Upsample)", "LASSO", "LASSO (1SE + Simplified)"),
+  AUC = c(metrics_glm$AUC, metrics_down$AUC, metrics_up$AUC, metrics_lasso$AUC, metrics_lasso_1se$AUC),
+  Recall = c(metrics_glm$Recall, metrics_down$Recall, metrics_up$Recall, metrics_lasso$Recall, metrics_lasso_1se$Recall),
+  F1 = c(metrics_glm$F1, metrics_down$F1, metrics_up$F1, metrics_lasso$F1, metrics_lasso_1se$F1)
+)
+
+knitr::kable(results_df, digits = 3, caption = "Model Performance Comparison")
+
+# Display Confusion Matrices for each model
+metrics_glm$CM
+metrics_down$CM
+metrics_up$CM
+metrics_lasso$CM
+metrics_lasso_1se$CM
 ```
 
-- **Logistic Regression Accuracy**: `r round(acc_glm, 4)`
-- **LASSO Accuracy**: `r round(acc_lasso, 4)`
-- **Ridge Accuracy**: `r round(acc_ridge, 4)`
+### Feature Importance
 
-# Conclusion
+We analyze the multiplicative impact of features on the odds of diabetes using the coefficients from each of the models.
 
-In this analysis, we built logistic regression models to predict diabetes. We compared a standard model with LASSO and Ridge regularization. 
+```{r feature_importance, fig.height=6, fig.width=8}
+# Extract coefficients
+plot_importances <- function(model, model_name) {
+  coefs <- coef(model$finalModel)
+  odds_ratios <- exp(coefs)
+  odds_df <- data.frame(Feature = names(odds_ratios), OddsRatio = odds_ratios) %>%
+    filter(Feature != "(Intercept)") %>%
+    arrange(desc(OddsRatio))
 
-(Note: Specific conclusions will depend on the actual run results).
+  ggplot(odds_df, aes(
+    x = reorder(Feature, OddsRatio),
+    y = OddsRatio,
+    fill = OddsRatio > 1
+  )) +
+    geom_col() +
+    scale_fill_manual(values = c(`TRUE` = "steelblue", `FALSE` = "red")) +
+    coord_flip() +
+    labs(
+      title = paste0("Feature Importance (Odds Ratios) - ", model_name),
+      x = "Feature",
+      y = "Multiplicative Impact on Odds",
+      fill = "Odds > 1"
+    ) +
+    theme_minimal()
+}
 
-\newpage
-# Appendix: R Code
+plot_importances(model_glm, "GLM (Standard)")
+```
+
+```{r}
+plot_importances(model_lasso_1se, "GLM (Lasso + 1SE)")
+```
+
+```{r}
+plot_importances(model_glm_down, "GLM (Downsample)")
+```
+
+# Fairness Analysis
+
+We examine the model's performance across different demographic groups to ensure fairness. We will use the Downsampled GLM for this analysis.
+
+```{r fairness_analysis}
+# Define demographic variables to check
+demo_vars <- c("Sex", "Age", "Education", "Income")
+
+# Function to print confusion matrix for subgroups
+analyze_fairness <- function(var_name, model, data) {
+  cat(paste0("\n### Fairness Analysis by ", var_name, "\n"))
+  groups <- unique(data[[var_name]])
+
+  for (g in sort(groups)) {
+    sub_data <- data[data[[var_name]] == g, ]
+    if (nrow(sub_data) > 0) {
+      preds <- predict(model, sub_data)
+      cm <- confusionMatrix(preds, sub_data$Diabetes_binary, positive = "Yes")
+      cat(paste0("\n#### Group: ", g, "\n"))
+      print(cm$table)
+      cat(paste0("Sensitivity: ", round(cm$byClass["Sensitivity"], 3), "\n"))
+      cat(paste0("Specificity: ", round(cm$byClass["Specificity"], 3), "\n"))
+      cat(paste0("Balanced Accuracy: ", round(cm$byClass["Balanced Accuracy"], 3), "\n"))
+    }
+  }
+}
+
+# Run fairness analysis
+for (var in demo_vars) {
+  if (var %in% names(dataTest)) {
+    analyze_fairness(var, model_glm_down, dataTest)
+  }
+}
+```
+
+```{r}
+for (var in demo_vars) {
+  if (var %in% names(dataTest)) {
+    analyze_fairness(var, model_glm, dataTest)
+  }
+}
+```
+
+```{r}
+for (var in demo_vars) {
+  if (var %in% names(dataTest)) {
+    analyze_fairness(var, model_lasso_1se, dataTest)
+  }
+}
+```
 
 ```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
 ```
